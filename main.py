@@ -1,21 +1,20 @@
 #!/usr/bin/env python3
 """
-Available Now Telegram Bot - Render Compatible Version
-Minimal, production-ready implementation using aiogram
+Available Now Telegram Bot - Pure Python Implementation
+Uses Telegram Bot API directly with requests library
+No external framework dependencies - works on any Python 3.13 environment
 """
 
 import os
-import asyncio
+import json
+import time
 import logging
+import threading
 from datetime import datetime, timedelta
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
+from urllib.parse import urljoin
 
-from aiogram import Bot, Dispatcher, types, F
-from aiogram.filters import Command
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
-from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+import requests
 
 # Setup logging
 logging.basicConfig(
@@ -24,8 +23,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Configuration from environment
-BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
+# Configuration
+BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '')
 TARGET_GROUP_ID = int(os.getenv('TARGET_GROUP_ID', 0)) if os.getenv('TARGET_GROUP_ID') else None
 APPROVED_ADMINS = set(os.getenv('APPROVED_ADMINS', '').split(',')) if os.getenv('APPROVED_ADMINS') else set()
 
@@ -34,20 +33,15 @@ if not BOT_TOKEN:
 
 logger.info(f"Bot configured - Group ID: {TARGET_GROUP_ID}, Admins: {len(APPROVED_ADMINS)}")
 
-# States
-class ProfileStates(StatesGroup):
-    name = State()
-    about = State()
-    contact = State()
-    rates = State()
-    preview = State()
-    duration = State()
+# Telegram API base URL
+TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
-# Simple in-memory database
+# In-memory database
 class Database:
     def __init__(self):
         self.profiles: Dict[int, Dict[str, Any]] = {}
         self.listings: Dict[int, Dict[str, Any]] = {}
+        self.user_states: Dict[int, Dict[str, Any]] = {}
     
     def save_profile(self, user_id: int, profile: Dict[str, Any]) -> None:
         self.profiles[user_id] = profile
@@ -89,224 +83,91 @@ class Database:
         
         return active
 
-# Initialize
 db = Database()
-storage = MemoryStorage()
-bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher(storage=storage)
 
-# Handlers
-@dp.message(Command("start"))
-async def cmd_start(message: types.Message) -> None:
-    """Start command"""
-    user_id = message.from_user.id
-    
-    if APPROVED_ADMINS and str(user_id) not in APPROVED_ADMINS:
-        await message.reply("❌ You are not authorized to use this bot.")
-        return
-    
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📝 Create Profile", callback_data="create")],
-        [InlineKeyboardButton(text="🗑️ Delete Profile", callback_data="delete")],
-        [InlineKeyboardButton(text="📢 Mark Available", callback_data="available")],
-    ])
-    
-    await message.reply(
-        "👋 Welcome to Available Now Bot!\n\nWhat would you like to do?",
-        reply_markup=keyboard
-    )
-
-@dp.callback_query(F.data == "create")
-async def create_profile(query: types.CallbackQuery, state: FSMContext) -> None:
-    """Start profile creation"""
-    user_id = query.from_user.id
-    
-    if APPROVED_ADMINS and str(user_id) not in APPROVED_ADMINS:
-        await query.answer("❌ Not authorized", show_alert=True)
-        return
-    
-    await query.answer()
-    await query.message.edit_text("📝 Enter your name or subject line:")
-    await state.set_state(ProfileStates.name)
-    await state.update_data(profile={})
-
-@dp.message(ProfileStates.name)
-async def handle_name(message: types.Message, state: FSMContext) -> None:
-    """Handle name input"""
-    await state.update_data(profile={'name': message.text})
-    await message.reply("Tell us about yourself:")
-    await state.set_state(ProfileStates.about)
-
-@dp.message(ProfileStates.about)
-async def handle_about(message: types.Message, state: FSMContext) -> None:
-    """Handle about input"""
-    data = await state.get_data()
-    profile = data['profile']
-    profile['about'] = message.text
-    
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📞 Phone", callback_data="phone")],
-        [InlineKeyboardButton(text="📧 Email", callback_data="email")],
-        [InlineKeyboardButton(text="💬 Telegram", callback_data="telegram")],
-    ])
-    
-    await message.reply("How should people contact you?", reply_markup=keyboard)
-    await state.update_data(profile=profile)
-    await state.set_state(ProfileStates.contact)
-
-@dp.callback_query(ProfileStates.contact)
-async def handle_contact(query: types.CallbackQuery, state: FSMContext) -> None:
-    """Handle contact method"""
-    await query.answer()
-    
-    data = await state.get_data()
-    profile = data['profile']
-    method = query.data
-    profile['contact_method'] = method
-    
-    if method == "phone":
-        await query.message.edit_text("Enter your phone number:")
-        await state.set_state(ProfileStates.rates)
-    elif method == "email":
-        await query.message.edit_text("Enter your email:")
-        await state.set_state(ProfileStates.rates)
-    else:
-        profile['contact'] = f"@{query.from_user.username or 'unknown'}"
-        await query.message.edit_text("Enter your rates (or 'skip'):")
-        await state.set_state(ProfileStates.rates)
-    
-    await state.update_data(profile=profile)
-
-@dp.message(ProfileStates.rates)
-async def handle_rates(message: types.Message, state: FSMContext) -> None:
-    """Handle rates input"""
-    data = await state.get_data()
-    profile = data['profile']
-    
-    if profile['contact_method'] in ['phone', 'email']:
-        profile['contact'] = message.text
-    else:
-        profile['rates'] = message.text if message.text.lower() != 'skip' else 'Not specified'
-    
-    # Save profile
-    user_id = message.from_user.id
-    db.save_profile(user_id, profile)
-    
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Confirm", callback_data="confirm")],
-        [InlineKeyboardButton(text="❌ Cancel", callback_data="cancel")],
-    ])
-    
-    preview = f"<b>{profile.get('name', 'N/A')}</b>\n\n"
-    preview += f"<b>About:</b> {profile.get('about', 'N/A')}\n\n"
-    preview += f"<b>Contact:</b> {profile.get('contact', 'N/A')}\n"
-    
-    await message.reply(preview, reply_markup=keyboard, parse_mode="HTML")
-    await state.set_state(ProfileStates.preview)
-
-@dp.callback_query(ProfileStates.preview)
-async def handle_preview(query: types.CallbackQuery, state: FSMContext) -> None:
-    """Handle preview confirmation"""
-    await query.answer()
-    
-    if query.data == "confirm":
-        await query.message.edit_text("✅ Profile saved!")
-    else:
-        await query.message.edit_text("❌ Cancelled")
-    
-    await state.clear()
-
-@dp.callback_query(F.data == "delete")
-async def delete_profile_cmd(query: types.CallbackQuery) -> None:
-    """Delete profile"""
-    user_id = query.from_user.id
-    
-    if APPROVED_ADMINS and str(user_id) not in APPROVED_ADMINS:
-        await query.answer("❌ Not authorized", show_alert=True)
-        return
-    
-    await query.answer()
-    
-    if db.delete_profile(user_id):
-        await query.message.edit_text("✅ Profile deleted")
-    else:
-        await query.message.edit_text("❌ No profile found")
-
-@dp.callback_query(F.data == "available")
-async def mark_available(query: types.CallbackQuery, state: FSMContext) -> None:
-    """Mark as available"""
-    user_id = query.from_user.id
-    
-    if APPROVED_ADMINS and str(user_id) not in APPROVED_ADMINS:
-        await query.answer("❌ Not authorized", show_alert=True)
-        return
-    
-    profile = db.get_profile(user_id)
-    if not profile:
-        await query.answer("❌ Create a profile first", show_alert=True)
-        return
-    
-    await query.answer()
-    
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="2 hours", callback_data="dur_2")],
-        [InlineKeyboardButton(text="4 hours", callback_data="dur_4")],
-        [InlineKeyboardButton(text="6 hours", callback_data="dur_6")],
-    ])
-    
-    await query.message.edit_text("How long will you be available?", reply_markup=keyboard)
-    await state.set_state(ProfileStates.duration)
-
-@dp.callback_query(ProfileStates.duration, F.data.startswith("dur_"))
-async def handle_duration(query: types.CallbackQuery, state: FSMContext) -> None:
-    """Handle availability duration"""
-    await query.answer()
-    
-    hours = int(query.data.split("_")[1])
-    user_id = query.from_user.id
-    profile = db.get_profile(user_id)
-    
-    if not profile or not TARGET_GROUP_ID:
-        await query.message.edit_text("❌ Error: Profile or group not configured")
-        await state.clear()
-        return
-    
+# Telegram API helpers
+def send_message(chat_id: int, text: str, reply_markup: Optional[Dict] = None, parse_mode: str = "HTML") -> bool:
+    """Send a message via Telegram API"""
     try:
-        # Create listing message
-        text = f"💋 <b>{profile.get('name', 'N/A')}</b> 💋\n\n"
-        text += f"📅 Posted: {datetime.now().strftime('%b %d, %I:%M %p')}\n"
-        text += f"⏰ Available for: {hours} hours\n\n"
-        text += f"<b>About:</b> {profile.get('about', 'N/A')}\n\n"
-        text += f"<b>Contact:</b> {profile.get('contact', 'N/A')}\n"
+        data = {
+            'chat_id': chat_id,
+            'text': text,
+            'parse_mode': parse_mode,
+        }
+        if reply_markup:
+            data['reply_markup'] = json.dumps(reply_markup)
         
-        if profile.get('rates'):
-            text += f"\n<b>Rates:</b> {profile['rates']}"
-        
-        # Post to group
-        await bot.send_message(
-            chat_id=TARGET_GROUP_ID,
-            text=text,
-            parse_mode="HTML"
-        )
-        
-        # Create listing
-        db.create_listing(user_id, hours)
-        
-        await query.message.edit_text(f"✅ Posted for {hours} hours!")
-        
+        response = requests.post(f"{TELEGRAM_API}/sendMessage", json=data, timeout=10)
+        return response.status_code == 200
     except Exception as e:
-        logger.error(f"Error posting listing: {e}")
-        await query.message.edit_text(f"❌ Error: {str(e)}")
-    
-    await state.clear()
+        logger.error(f"Error sending message: {e}")
+        return False
 
-@dp.message(Command("available"))
-async def available_list(message: types.Message) -> None:
-    """List available models"""
+def answer_callback(callback_query_id: str, text: str = "", show_alert: bool = False) -> bool:
+    """Answer a callback query"""
+    try:
+        data = {
+            'callback_query_id': callback_query_id,
+            'text': text,
+            'show_alert': show_alert,
+        }
+        response = requests.post(f"{TELEGRAM_API}/answerCallbackQuery", json=data, timeout=10)
+        return response.status_code == 200
+    except Exception as e:
+        logger.error(f"Error answering callback: {e}")
+        return False
+
+def edit_message(chat_id: int, message_id: int, text: str, reply_markup: Optional[Dict] = None, parse_mode: str = "HTML") -> bool:
+    """Edit a message"""
+    try:
+        data = {
+            'chat_id': chat_id,
+            'message_id': message_id,
+            'text': text,
+            'parse_mode': parse_mode,
+        }
+        if reply_markup:
+            data['reply_markup'] = json.dumps(reply_markup)
+        
+        response = requests.post(f"{TELEGRAM_API}/editMessageText", json=data, timeout=10)
+        return response.status_code == 200
+    except Exception as e:
+        logger.error(f"Error editing message: {e}")
+        return False
+
+def get_updates(offset: int = 0) -> List[Dict]:
+    """Get updates from Telegram"""
+    try:
+        response = requests.post(f"{TELEGRAM_API}/getUpdates", json={'offset': offset, 'timeout': 30}, timeout=35)
+        if response.status_code == 200:
+            return response.json().get('result', [])
+    except Exception as e:
+        logger.error(f"Error getting updates: {e}")
+    return []
+
+# Message handlers
+def handle_start(user_id: int, chat_id: int, message_id: int) -> None:
+    """Handle /start command"""
+    if APPROVED_ADMINS and str(user_id) not in APPROVED_ADMINS:
+        send_message(chat_id, "❌ You are not authorized to use this bot.")
+        return
+    
+    keyboard = {
+        'inline_keyboard': [
+            [{'text': '📝 Create Profile', 'callback_data': 'create'}],
+            [{'text': '🗑️ Delete Profile', 'callback_data': 'delete'}],
+            [{'text': '📢 Mark Available', 'callback_data': 'available'}],
+        ]
+    }
+    
+    send_message(chat_id, "👋 Welcome to Available Now Bot!\n\nWhat would you like to do?", reply_markup=keyboard)
+
+def handle_available_command(chat_id: int) -> None:
+    """Handle /available command in group"""
     listings = db.get_active_listings()
     
     if not listings:
-        await message.reply("📋 No models available right now")
+        send_message(chat_id, "📋 No models available right now")
         return
     
     text = "📋 <b>Available Now:</b>\n\n"
@@ -316,12 +177,199 @@ async def available_list(message: types.Message) -> None:
             text += f"{i}. <b>{profile.get('name', 'N/A')}</b>\n"
             text += f"   Contact: {profile.get('contact', 'N/A')}\n\n"
     
-    await message.reply(text, parse_mode="HTML")
+    send_message(chat_id, text)
 
-async def main():
-    """Start the bot"""
-    logger.info("Starting bot...")
-    await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+def handle_callback(callback_id: str, user_id: int, chat_id: int, message_id: int, data: str) -> None:
+    """Handle callback queries"""
+    answer_callback(callback_id)
+    
+    if data == "create":
+        if APPROVED_ADMINS and str(user_id) not in APPROVED_ADMINS:
+            answer_callback(callback_id, "❌ Not authorized", show_alert=True)
+            return
+        
+        db.user_states[user_id] = {'step': 'name', 'profile': {}}
+        edit_message(chat_id, message_id, "📝 Enter your name or subject line:")
+    
+    elif data == "delete":
+        if APPROVED_ADMINS and str(user_id) not in APPROVED_ADMINS:
+            answer_callback(callback_id, "❌ Not authorized", show_alert=True)
+            return
+        
+        if db.delete_profile(user_id):
+            edit_message(chat_id, message_id, "✅ Profile deleted")
+        else:
+            edit_message(chat_id, message_id, "❌ No profile found")
+    
+    elif data == "available":
+        if APPROVED_ADMINS and str(user_id) not in APPROVED_ADMINS:
+            answer_callback(callback_id, "❌ Not authorized", show_alert=True)
+            return
+        
+        profile = db.get_profile(user_id)
+        if not profile:
+            answer_callback(callback_id, "❌ Create a profile first", show_alert=True)
+            return
+        
+        keyboard = {
+            'inline_keyboard': [
+                [{'text': '2 hours', 'callback_data': 'dur_2'}],
+                [{'text': '4 hours', 'callback_data': 'dur_4'}],
+                [{'text': '6 hours', 'callback_data': 'dur_6'}],
+            ]
+        }
+        edit_message(chat_id, message_id, "How long will you be available?", reply_markup=keyboard)
+        db.user_states[user_id] = {'step': 'duration'}
+    
+    elif data.startswith("dur_"):
+        hours = int(data.split("_")[1])
+        profile = db.get_profile(user_id)
+        
+        if not profile or not TARGET_GROUP_ID:
+            edit_message(chat_id, message_id, "❌ Error: Profile or group not configured")
+            return
+        
+        try:
+            # Create listing message
+            text = f"💋 <b>{profile.get('name', 'N/A')}</b> 💋\n\n"
+            text += f"📅 Posted: {datetime.now().strftime('%b %d, %I:%M %p')}\n"
+            text += f"⏰ Available for: {hours} hours\n\n"
+            text += f"<b>About:</b> {profile.get('about', 'N/A')}\n\n"
+            text += f"<b>Contact:</b> {profile.get('contact', 'N/A')}\n"
+            
+            if profile.get('rates'):
+                text += f"\n<b>Rates:</b> {profile['rates']}"
+            
+            # Post to group
+            send_message(TARGET_GROUP_ID, text)
+            
+            # Create listing
+            db.create_listing(user_id, hours)
+            
+            edit_message(chat_id, message_id, f"✅ Posted for {hours} hours!")
+            
+        except Exception as e:
+            logger.error(f"Error posting listing: {e}")
+            edit_message(chat_id, message_id, f"❌ Error: {str(e)}")
 
-if __name__ == "__main__":
-    asyncio.run(main())
+def handle_text(user_id: int, chat_id: int, text: str) -> None:
+    """Handle text messages"""
+    state = db.user_states.get(user_id, {})
+    step = state.get('step')
+    
+    if step == 'name':
+        state['profile']['name'] = text
+        state['step'] = 'about'
+        send_message(chat_id, "Tell us about yourself:")
+    
+    elif step == 'about':
+        state['profile']['about'] = text
+        state['step'] = 'contact'
+        keyboard = {
+            'inline_keyboard': [
+                [{'text': '📞 Phone', 'callback_data': 'contact_phone'}],
+                [{'text': '📧 Email', 'callback_data': 'contact_email'}],
+                [{'text': '💬 Telegram', 'callback_data': 'contact_telegram'}],
+            ]
+        }
+        send_message(chat_id, "How should people contact you?", reply_markup=keyboard)
+    
+    elif step == 'contact_input':
+        state['profile']['contact'] = text
+        state['step'] = 'rates'
+        send_message(chat_id, "Enter your rates (or 'skip'):")
+    
+    elif step == 'rates':
+        if text.lower() != 'skip':
+            state['profile']['rates'] = text
+        
+        # Save profile
+        db.save_profile(user_id, state['profile'])
+        
+        keyboard = {
+            'inline_keyboard': [
+                [{'text': '✅ Confirm', 'callback_data': 'confirm'}],
+                [{'text': '❌ Cancel', 'callback_data': 'cancel'}],
+            ]
+        }
+        
+        profile = state['profile']
+        preview = f"<b>{profile.get('name', 'N/A')}</b>\n\n"
+        preview += f"<b>About:</b> {profile.get('about', 'N/A')}\n\n"
+        preview += f"<b>Contact:</b> {profile.get('contact', 'N/A')}\n"
+        
+        send_message(chat_id, preview, reply_markup=keyboard)
+        state['step'] = 'preview'
+    
+    db.user_states[user_id] = state
+
+def handle_callback_contact(callback_id: str, user_id: int, chat_id: int, data: str) -> None:
+    """Handle contact method selection"""
+    answer_callback(callback_id)
+    
+    state = db.user_states.get(user_id, {'profile': {}})
+    
+    if data == 'contact_phone':
+        send_message(chat_id, "Enter your phone number:")
+        state['step'] = 'contact_input'
+    elif data == 'contact_email':
+        send_message(chat_id, "Enter your email:")
+        state['step'] = 'contact_input'
+    elif data == 'contact_telegram':
+        state['profile']['contact'] = f"@{data}"  # Placeholder
+        state['step'] = 'rates'
+        send_message(chat_id, "Enter your rates (or 'skip'):")
+    
+    db.user_states[user_id] = state
+
+# Main polling loop
+def main():
+    """Main bot loop"""
+    logger.info("Starting bot polling...")
+    offset = 0
+    
+    while True:
+        try:
+            updates = get_updates(offset)
+            
+            for update in updates:
+                offset = update['update_id'] + 1
+                
+                # Handle messages
+                if 'message' in update:
+                    msg = update['message']
+                    user_id = msg['from']['id']
+                    chat_id = msg['chat']['id']
+                    
+                    if 'text' in msg:
+                        text = msg['text']
+                        
+                        if text == '/start':
+                            handle_start(user_id, chat_id, msg['message_id'])
+                        elif text == '/available':
+                            handle_available_command(chat_id)
+                        else:
+                            handle_text(user_id, chat_id, text)
+                
+                # Handle callback queries
+                elif 'callback_query' in update:
+                    query = update['callback_query']
+                    user_id = query['from']['id']
+                    chat_id = query['message']['chat']['id']
+                    message_id = query['message']['message_id']
+                    data = query['data']
+                    callback_id = query['id']
+                    
+                    if data.startswith('contact_'):
+                        handle_callback_contact(callback_id, user_id, chat_id, data)
+                    else:
+                        handle_callback(callback_id, user_id, chat_id, message_id, data)
+            
+            time.sleep(0.1)
+        
+        except Exception as e:
+            logger.error(f"Error in main loop: {e}")
+            time.sleep(1)
+
+if __name__ == '__main__':
+    main()
