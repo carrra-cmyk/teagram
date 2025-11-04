@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: teagram-bot
+    env: docker
+    region: oregon
+    plan: free
+    startCommand: python bot.py
+    healthCheckPath: /
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TARGET_GROUP_ID
+        sync: false
+      - key: APPROVED_ADMINS
+        sync: false
+    dockerfilePath: ./Dockerfile
+    autoDeploy: true

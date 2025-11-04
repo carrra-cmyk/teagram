@@ -1,0 +1,26 @@
+version: '3.8'
+
+services:
+  teagram-bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: teagram-bot
+    restart: unless-stopped
+    environment:
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - TARGET_GROUP_ID=${TARGET_GROUP_ID}
+      - APPROVED_ADMINS=${APPROVED_ADMINS}
+    volumes:
+      - ./logs:/app/logs
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    networks:
+      - teagram-network
+
+networks:
+  teagram-network:
+    driver: bridge
